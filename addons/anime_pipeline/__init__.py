@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Anime Pipeline",
     "author": "Animation Studio",
-    "version": (0, 2, 0),
+    "version": (0, 4, 2),
     "blender": (3, 6, 0),
     "location": "View3D > N-Panel > Anime",
     "description": "Setup toon shading, outlines, and scene templates for anime-style rendering.",
@@ -11,8 +11,7 @@ bl_info = {
 
 try:
     import bpy  # type: ignore
-    from bpy.props import FloatProperty, FloatVectorProperty, BoolProperty, EnumProperty  # type: ignore
-    from bpy.props import StringProperty, IntProperty
+    from bpy.props import FloatProperty, FloatVectorProperty, BoolProperty, EnumProperty, StringProperty, IntProperty  # type: ignore
 except Exception:  # pragma: no cover - outside Blender
     bpy = None  # type: ignore
     def FloatProperty(**kwargs):  # type: ignore
@@ -30,7 +29,7 @@ except Exception:  # pragma: no cover - outside Blender
 
 # stdlib for update checks (guarded at runtime)
 import json, os, tempfile
-from urllib.request import urlopen
+from urllib.request import urlopen, Request
 from urllib.error import URLError, HTTPError
 
 # Update state (global, simple)
@@ -40,6 +39,60 @@ _UPDATE_STATE = {
     'zip_url': None,
     'notes': None,
 }
+
+# Safe accessors for Blender PropertyDeferred values (seen in 3.6 UI properties)
+def _safe_str(val, default=""):
+    # Return a clean string or default when Blender returns deferred RNA wrappers
+    if isinstance(val, str):
+        return val
+    if val is None:
+        return default
+    tname = type(val).__name__
+    if tname in {"_PropertyDeferred", "bpy_prop", "bpy_struct", "bpy_prop_collection"}:
+        return default
+    try:
+        s = str(val)
+        # Guard against repr-like strings for RNA wrappers
+        if s is None:
+            return default
+        if "_PropertyDeferred" in s or "bpy_prop" in s or "bpy_struct" in s:
+            return default
+        return s
+    except Exception:
+        return default
+
+def _safe_bool(val, default=False):
+    if isinstance(val, bool):
+        return val
+    if val is None:
+        return default
+    tname = type(val).__name__
+    if tname in {"_PropertyDeferred", "bpy_prop", "bpy_struct", "bpy_prop_collection"}:
+        return default
+    try:
+        if isinstance(val, (int, float)):
+            return bool(val)
+        if isinstance(val, str):
+            return val.strip().lower() in {"1", "true", "yes", "on"}
+        return bool(val)
+    except Exception:
+        return default
+
+def _safe_int(val, default=0):
+    if isinstance(val, bool):
+        return int(val)
+    if val is None:
+        return default
+    tname = type(val).__name__
+    if tname in {"_PropertyDeferred", "bpy_prop", "bpy_struct", "bpy_prop_collection"}:
+        return default
+    try:
+        return int(val)
+    except Exception:
+        try:
+            return int(str(val).strip())
+        except Exception:
+            return default
 
 def _version_tuple_from_any(v):
     try:
@@ -143,6 +196,171 @@ class ANIME_OT_apply_toon_material(bpy.types.Operator):
     bl_label = "Apply Toon Material"
     bl_description = "Assign a toon shader node group to selected meshes"
     bl_options = {"REGISTER", "UNDO"}
+
+# New: Manga halftone node group
+def ensure_manga_group():
+    """Create or fetch the Manga_Halftone_Core node group and ensure its structure."""
+    ng = bpy.data.node_groups.get("Manga_Halftone_Core")
+    if not ng:
+        ng = bpy.data.node_groups.new("Manga_Halftone_Core", 'ShaderNodeTree')
+
+    # IO helpers
+    def ensure_input(name, socket_type, default=None):
+        sock = ng.inputs.get(name)
+        if not sock:
+            sock = ng.inputs.new(socket_type, name)
+        if default is not None:
+            try:
+                sock.default_value = default
+            except Exception:
+                pass
+        return sock
+
+    def ensure_output(name, socket_type):
+        sock = ng.outputs.get(name)
+        if not sock:
+            sock = ng.outputs.new(socket_type, name)
+        return sock
+
+    # Define inputs/outputs
+    ensure_input('BaseColor', 'NodeSocketColor', (0.8, 0.8, 0.8, 1))
+    ensure_input('ShadowSteps', 'NodeSocketFloat', 3.0)
+    ensure_input('ToneScale', 'NodeSocketFloat', 80.0)
+    ensure_input('ToneAngleDeg', 'NodeSocketFloat', 45.0)
+    ensure_input('ToneStrength', 'NodeSocketFloat', 1.0)
+    ensure_input('InkColor', 'NodeSocketColor', (0.0, 0.0, 0.0, 1))
+    ensure_input('PaperColor', 'NodeSocketColor', (1.0, 1.0, 1.0, 1))
+    ensure_input('PatternType', 'NodeSocketFloat', 0.0)  # 0=dots, 1=lines
+    ensure_input('InvertTone', 'NodeSocketFloat', 0.0)
+    ensure_output('BSDF', 'NodeSocketShader')
+    ensure_output('ShadowMask', 'NodeSocketFloat')
+    ensure_output('RimMask', 'NodeSocketFloat')
+    ensure_output('SpecularMask', 'NodeSocketFloat')
+
+    # Rebuild nodes
+    for n in list(ng.nodes):
+        ng.nodes.remove(n)
+
+    n_in = ng.nodes.new('NodeGroupInput'); n_in.location = (-800, 0)
+    n_out = ng.nodes.new('NodeGroupOutput'); n_out.location = (800, 0)
+
+    # Diffuse to brightness and banding
+    n_diff = ng.nodes.new('ShaderNodeBsdfDiffuse'); n_diff.location = (-600, 40)
+    n_strgb = ng.nodes.new('ShaderNodeShaderToRGB'); n_strgb.location = (-420, 40)
+    n_bw = ng.nodes.new('ShaderNodeRGBToBW'); n_bw.location = (-240, 40)
+    n_mul = ng.nodes.new('ShaderNodeMath'); n_mul.operation = 'MULTIPLY'; n_mul.location = (-60, 40)
+    n_floor = ng.nodes.new('ShaderNodeMath'); n_floor.operation = 'FLOOR'; n_floor.location = (120, 40)
+    n_div = ng.nodes.new('ShaderNodeMath'); n_div.operation = 'DIVIDE'; n_div.location = (300, 40)
+    n_inv = ng.nodes.new('ShaderNodeMath'); n_inv.operation = 'SUBTRACT'; n_inv.inputs[0].default_value = 1.0; n_inv.location = (480, 40)
+
+    # Tone pattern: coordinates -> rotate -> voronoi
+    n_texcoord = ng.nodes.new('ShaderNodeTexCoord'); n_texcoord.location = (-620, -220)
+    n_map = ng.nodes.new('ShaderNodeMapping'); n_map.location = (-420, -220)
+    # Set rotation Z from degrees -> radians via driver-style multiply (using Math node)
+    n_deg2rad = ng.nodes.new('ShaderNodeMath'); n_deg2rad.operation = 'MULTIPLY'; n_deg2rad.inputs[1].default_value = 0.01745329252; n_deg2rad.location = (-620, -340)
+    # In older Blender, Mapping uses node properties; set safely
+    try:
+        n_map.vector_type = 'POINT'
+    except Exception:
+        pass
+    n_voro = ng.nodes.new('ShaderNodeTexVoronoi'); n_voro.location = (-200, -280)
+    n_voro.feature = 'F1'; n_voro.distance = 'EUCLIDEAN'
+    # Lines pattern: use Wave texture
+    n_wave = ng.nodes.new('ShaderNodeTexWave'); n_wave.location = (-200, -160)
+    try:
+        n_wave.wave_type = 'BANDS'
+    except Exception:
+        pass
+
+    # Normalize Voronoi distance a bit
+    n_vscale = ng.nodes.new('ShaderNodeMath'); n_vscale.operation = 'MULTIPLY'; n_vscale.inputs[1].default_value = 2.0; n_vscale.location = (0, -220)
+    n_clamp = ng.nodes.new('ShaderNodeMath'); n_clamp.operation = 'MINIMUM'; n_clamp.inputs[1].default_value = 1.0; n_clamp.location = (180, -220)
+
+    # Halftone threshold: pattern < inv_brightness
+    n_lt = ng.nodes.new('ShaderNodeMath'); n_lt.operation = 'LESS_THAN'; n_lt.location = (360, -120)
+    n_mix = ng.nodes.new('ShaderNodeMixRGB'); n_mix.blend_type = 'MIX'; n_mix.inputs['Fac'].default_value = 1.0; n_mix.location = (600, -40)
+    n_em = ng.nodes.new('ShaderNodeEmission'); n_em.location = (640, 120)
+
+    # Links core
+    ng.links.new(n_in.outputs['BaseColor'], n_diff.inputs['Color'])
+    ng.links.new(n_diff.outputs['BSDF'], n_strgb.inputs['Shader'])
+    ng.links.new(n_strgb.outputs['Color'], n_bw.inputs['Color'])
+    ng.links.new(n_bw.outputs['Val'], n_mul.inputs[0])
+    ng.links.new(n_in.outputs['ShadowSteps'], n_mul.inputs[1])
+    ng.links.new(n_mul.outputs[0], n_floor.inputs[0])
+    ng.links.new(n_floor.outputs[0], n_div.inputs[0])
+    ng.links.new(n_in.outputs['ShadowSteps'], n_div.inputs[1])
+    ng.links.new(n_div.outputs[0], n_inv.inputs[1])  # inv = 1 - banded
+
+    # Mapping rotation deg->rad and feed to node (prefer socket link, else set property)
+    ng.links.new(n_in.outputs['ToneAngleDeg'], n_deg2rad.inputs[0])
+    try:
+        n_cxyz = ng.nodes.new('ShaderNodeCombineXYZ'); n_cxyz.location = (-420, -340)
+        # X,Y = 0; Z comes from deg2rad
+        n_cxyz.inputs[0].default_value = 0.0
+        n_cxyz.inputs[1].default_value = 0.0
+        ng.links.new(n_deg2rad.outputs[0], n_cxyz.inputs[2])
+        ng.links.new(n_cxyz.outputs['Vector'], n_map.inputs['Rotation'])
+    except Exception:
+        try:
+            n_map.rotation[2] = 0.0  # fallback default; actual angle may be set by operators if needed
+        except Exception:
+            pass
+    # Coordinates path
+    try:
+        ng.links.new(n_texcoord.outputs['Generated'], n_map.inputs['Vector'])
+    except Exception:
+        try:
+            ng.links.new(n_texcoord.outputs[0], n_map.inputs[0])
+        except Exception:
+            pass
+    ng.links.new(n_map.outputs['Vector'], n_voro.inputs['Vector'])
+    ng.links.new(n_map.outputs['Vector'], n_wave.inputs['Vector'])
+    ng.links.new(n_in.outputs['ToneScale'], n_voro.inputs['Scale'])
+    ng.links.new(n_in.outputs['ToneScale'], n_wave.inputs['Scale'])
+    ng.links.new(n_voro.outputs['Distance'], n_vscale.inputs[0])
+    ng.links.new(n_vscale.outputs[0], n_clamp.inputs[0])
+
+    # Choose pattern by PatternType >= 0.5 ? Lines : Dots
+    n_ge = ng.nodes.new('ShaderNodeMath'); n_ge.operation = 'GREATER_THAN'; n_ge.location = (160, -140)
+    ng.links.new(n_in.outputs['PatternType'], n_ge.inputs[0])
+    n_patmix = ng.nodes.new('ShaderNodeMixRGB'); n_patmix.blend_type = 'MIX'; n_patmix.location = (360, -200)
+    ng.links.new(n_ge.outputs[0], n_patmix.inputs['Fac'])
+    ng.links.new(n_clamp.outputs[0], n_patmix.inputs['Color1'])  # dots
+    ng.links.new(n_wave.outputs['Color'], n_patmix.inputs['Color2'])  # lines
+
+    # Invert tone if requested
+    n_invton = ng.nodes.new('ShaderNodeMath'); n_invton.operation = 'SUBTRACT'; n_invton.inputs[0].default_value = 1.0; n_invton.location = (540, -200)
+    n_invlerp = ng.nodes.new('ShaderNodeMixRGB'); n_invlerp.blend_type = 'MIX'; n_invlerp.location = (720, -200)
+    ng.links.new(n_patmix.outputs['Color'], n_invton.inputs[1])
+    ng.links.new(n_in.outputs['InvertTone'], n_invlerp.inputs['Fac'])
+    ng.links.new(n_patmix.outputs['Color'], n_invlerp.inputs['Color1'])
+    ng.links.new(n_invton.outputs[0], n_invlerp.inputs['Color2'])
+
+    # Threshold compare and color mix
+    ng.links.new(n_invlerp.outputs['Color'], n_lt.inputs[0])  # A: pattern
+    ng.links.new(n_inv.outputs[0], n_lt.inputs[1])    # B: inv brightness
+    # Paper color comes directly from group input
+    ng.links.new(n_in.outputs['PaperColor'], n_mix.inputs['Color1'])
+    ng.links.new(n_in.outputs['InkColor'], n_mix.inputs['Color2'])
+    # Use less-than result modulated by ToneStrength as Fac via math* and clamp
+    n_facmul = ng.nodes.new('ShaderNodeMath'); n_facmul.operation = 'MULTIPLY'; n_facmul.location = (520, -120)
+    n_facclamp = ng.nodes.new('ShaderNodeMath'); n_facclamp.operation = 'MINIMUM'; n_facclamp.inputs[1].default_value = 1.0; n_facclamp.location = (700, -120)
+    ng.links.new(n_lt.outputs[0], n_facmul.inputs[0])
+    ng.links.new(n_in.outputs['ToneStrength'], n_facmul.inputs[1])
+    ng.links.new(n_facmul.outputs[0], n_facclamp.inputs[0])
+    ng.links.new(n_facclamp.outputs[0], n_mix.inputs['Fac'])
+
+    # Output
+    ng.links.new(n_mix.outputs['Color'], n_em.inputs['Color'])
+    ng.links.new(n_em.outputs['Emission'], n_out.inputs['BSDF'])
+    # Provide masks (shadow uses inv brightness; others zero)
+    zero = ng.nodes.new('ShaderNodeValue'); zero.outputs[0].default_value = 0.0; zero.location = (520, 200)
+    ng.links.new(n_inv.outputs[0], n_out.inputs['ShadowMask'])
+    ng.links.new(zero.outputs[0], n_out.inputs['RimMask'])
+    ng.links.new(zero.outputs[0], n_out.inputs['SpecularMask'])
+
+    return ng
 
 def ensure_toon_group():
     """Create or fetch the Toon_Shade_Core node group and ensure its structure."""
@@ -367,6 +585,144 @@ class ANIME_OT_apply_toon_material(bpy.types.Operator):
         nt.links.new(in_spec_col.outputs[0], grp.inputs['SpecularColor'])
         nt.links.new(grp.outputs['BSDF'], out.inputs['Surface'])
         # Link AOV mask outputs
+        try:
+            nt.links.new(grp.outputs['ShadowMask'], aov_shadow.inputs['Value'])
+            nt.links.new(grp.outputs['RimMask'], aov_rim.inputs['Value'])
+            nt.links.new(grp.outputs['SpecularMask'], aov_spec.inputs['Value'])
+        except Exception:
+            pass
+        for obj in sel:
+            if obj.data.materials:
+                obj.data.materials[0] = mat
+            else:
+                obj.data.materials.append(mat)
+        return {'FINISHED'}
+
+class ANIME_OT_apply_style_material(bpy.types.Operator):
+    bl_idname = "anime.apply_style_material"
+    bl_label = "Apply Style Material"
+    bl_description = "Apply the selected Anime/Manga style material to selected meshes"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        sel = [o for o in context.selected_objects if o.type == 'MESH']
+        if not sel:
+            self.report({'WARNING'}, "Select mesh objects")
+            return {'CANCELLED'}
+        scene = context.scene
+        style = getattr(scene, 'anime_style_mode', 'ANIME')
+
+        if style == 'MANGA':
+            ng = ensure_manga_group()
+            mat = bpy.data.materials.get("Manga_Tone") or bpy.data.materials.new("Manga_Tone")
+            mat.use_nodes = True
+            nt = mat.node_tree
+            for n in list(nt.nodes):
+                nt.nodes.remove(n)
+            out = nt.nodes.new('ShaderNodeOutputMaterial'); out.location = (320, 0)
+            grp = nt.nodes.new('ShaderNodeGroup'); grp.node_tree = ng; grp.location = (0, 0)
+            in_rgb = nt.nodes.new('ShaderNodeRGB'); in_rgb.location = (-300, 60); in_rgb.outputs[0].default_value = (0.9, 0.9, 0.9, 1)
+            in_steps = nt.nodes.new('ShaderNodeValue'); in_steps.location = (-300, -20); in_steps.outputs[0].default_value = 3.0
+            # Manga-specific controls from scene
+            tone_scale = float(getattr(scene, 'anime_manga_tone_scale', 80.0))
+            tone_angle = float(getattr(scene, 'anime_manga_tone_angle', 45.0))
+            tone_strength = float(getattr(scene, 'anime_manga_tone_strength', 1.0))
+            ink_col = tuple(getattr(scene, 'anime_manga_ink_color', (0.0,0.0,0.0)))
+            paper_col = tuple(getattr(scene, 'anime_manga_paper_color', (1.0,1.0,1.0)))
+            pattern_type = float(getattr(scene, 'anime_manga_pattern_type', 0.0))
+            invert_tone = float(getattr(scene, 'anime_manga_invert_tone', 0.0))
+            in_scale = nt.nodes.new('ShaderNodeValue'); in_scale.location = (-300, -100); in_scale.outputs[0].default_value = tone_scale
+            in_angle = nt.nodes.new('ShaderNodeValue'); in_angle.location = (-300, -180); in_angle.outputs[0].default_value = tone_angle
+            in_strength = nt.nodes.new('ShaderNodeValue'); in_strength.location = (-300, -260); in_strength.outputs[0].default_value = tone_strength
+            in_ink = nt.nodes.new('ShaderNodeRGB'); in_ink.location = (-300, -340); in_ink.outputs[0].default_value = (ink_col[0], ink_col[1], ink_col[2], 1)
+            in_paper = nt.nodes.new('ShaderNodeRGB'); in_paper.location = (-300, -420); in_paper.outputs[0].default_value = (paper_col[0], paper_col[1], paper_col[2], 1)
+            in_pattern = nt.nodes.new('ShaderNodeValue'); in_pattern.location = (-300, -500); in_pattern.outputs[0].default_value = pattern_type
+            in_invert = nt.nodes.new('ShaderNodeValue'); in_invert.location = (-300, -580); in_invert.outputs[0].default_value = invert_tone
+            # AOV nodes
+            aov_shadow = nt.nodes.new('ShaderNodeOutputAOV'); aov_shadow.location = (320, -220)
+            aov_rim = nt.nodes.new('ShaderNodeOutputAOV'); aov_rim.location = (320, -300)
+            aov_spec = nt.nodes.new('ShaderNodeOutputAOV'); aov_spec.location = (320, -380)
+            try:
+                aov_shadow.name = 'AOV_ShadowMask'; setattr(aov_shadow, 'aov_name', 'ShadowMask')
+                aov_rim.name = 'AOV_RimMask'; setattr(aov_rim, 'aov_name', 'RimMask')
+                aov_spec.name = 'AOV_SpecularMask'; setattr(aov_spec, 'aov_name', 'SpecularMask')
+            except Exception:
+                aov_shadow.name = 'ShadowMask'; aov_rim.name = 'RimMask'; aov_spec.name = 'SpecularMask'
+                try:
+                    aov_shadow.label = 'AOV_ShadowMask'; aov_rim.label = 'AOV_RimMask'; aov_spec.label = 'AOV_SpecularMask'
+                except Exception:
+                    pass
+            # Links
+            nt.links.new(in_rgb.outputs[0], grp.inputs['BaseColor'])
+            nt.links.new(in_steps.outputs[0], grp.inputs['ShadowSteps'])
+            nt.links.new(in_scale.outputs[0], grp.inputs['ToneScale'])
+            nt.links.new(in_angle.outputs[0], grp.inputs['ToneAngleDeg'])
+            nt.links.new(in_strength.outputs[0], grp.inputs['ToneStrength'])
+            nt.links.new(in_ink.outputs[0], grp.inputs['InkColor'])
+            nt.links.new(in_paper.outputs[0], grp.inputs['PaperColor'])
+            nt.links.new(in_pattern.outputs[0], grp.inputs['PatternType'])
+            nt.links.new(in_invert.outputs[0], grp.inputs['InvertTone'])
+            nt.links.new(grp.outputs['BSDF'], out.inputs['Surface'])
+            # AOV mask links
+            try:
+                nt.links.new(grp.outputs['ShadowMask'], aov_shadow.inputs['Value'])
+            except Exception:
+                pass
+            try:
+                nt.links.new(grp.outputs['RimMask'], aov_rim.inputs['Value'])
+            except Exception:
+                pass
+            try:
+                nt.links.new(grp.outputs['SpecularMask'], aov_spec.inputs['Value'])
+            except Exception:
+                pass
+            for obj in sel:
+                if obj.data.materials:
+                    obj.data.materials[0] = mat
+                else:
+                    obj.data.materials.append(mat)
+            return {'FINISHED'}
+
+        # Default: Anime (Toon)
+        ng = ensure_toon_group()
+        mat = bpy.data.materials.get("Anime_Toon") or bpy.data.materials.new("Anime_Toon")
+        mat.use_nodes = True
+        nt = mat.node_tree
+        for n in list(nt.nodes):
+            nt.nodes.remove(n)
+        out = nt.nodes.new('ShaderNodeOutputMaterial'); out.location = (220, 0)
+        grp = nt.nodes.new('ShaderNodeGroup'); grp.node_tree = ng; grp.location = (0, 0)
+        in_rgb = nt.nodes.new('ShaderNodeRGB'); in_rgb.outputs[0].default_value = (0.8, 0.8, 0.8, 1); in_rgb.location = (-300, 80)
+        in_rim = nt.nodes.new('ShaderNodeRGB'); in_rim.outputs[0].default_value = (1.0, 1.0, 1.0, 1); in_rim.location = (-300, -20)
+        in_steps = nt.nodes.new('ShaderNodeValue'); in_steps.outputs[0].default_value = 3.0; in_steps.location = (-300, -120)
+        in_rimpow = nt.nodes.new('ShaderNodeValue'); in_rimpow.outputs[0].default_value = 1.5; in_rimpow.location = (-300, -200)
+        in_ramp = nt.nodes.new('ShaderNodeValue'); in_ramp.outputs[0].default_value = 0.0; in_ramp.location = (-300, -260)
+        in_spec_size = nt.nodes.new('ShaderNodeValue'); in_spec_size.outputs[0].default_value = 0.1; in_spec_size.location = (-300, -340)
+        in_spec_int = nt.nodes.new('ShaderNodeValue'); in_spec_int.outputs[0].default_value = 1.0; in_spec_int.location = (-300, -420)
+        in_spec_col = nt.nodes.new('ShaderNodeRGB'); in_spec_col.outputs[0].default_value = (1.0, 1.0, 1.0, 1); in_spec_col.location = (-300, -500)
+        aov_shadow = nt.nodes.new('ShaderNodeOutputAOV'); aov_shadow.location = (220, -220)
+        aov_rim = nt.nodes.new('ShaderNodeOutputAOV'); aov_rim.location = (220, -300)
+        aov_spec = nt.nodes.new('ShaderNodeOutputAOV'); aov_spec.location = (220, -380)
+        try:
+            aov_shadow.name = 'AOV_ShadowMask'; setattr(aov_shadow, 'aov_name', 'ShadowMask')
+            aov_rim.name = 'AOV_RimMask'; setattr(aov_rim, 'aov_name', 'RimMask')
+            aov_spec.name = 'AOV_SpecularMask'; setattr(aov_spec, 'aov_name', 'SpecularMask')
+        except Exception:
+            aov_shadow.name = 'ShadowMask'; aov_rim.name = 'RimMask'; aov_spec.name = 'SpecularMask'
+            try:
+                aov_shadow.label = 'AOV_ShadowMask'; aov_rim.label = 'AOV_RimMask'; aov_spec.label = 'AOV_SpecularMask'
+            except Exception:
+                pass
+        # Links
+        nt.links.new(in_rgb.outputs[0], grp.inputs['BaseColor'])
+        nt.links.new(in_steps.outputs[0], grp.inputs['ShadowSteps'])
+        nt.links.new(in_rimpow.outputs[0], grp.inputs['RimPower'])
+        nt.links.new(in_rim.outputs[0], grp.inputs['RimColor'])
+        nt.links.new(in_ramp.outputs[0], grp.inputs['RampStrength'])
+        nt.links.new(in_spec_size.outputs[0], grp.inputs['SpecularSize'])
+        nt.links.new(in_spec_int.outputs[0], grp.inputs['SpecularIntensity'])
+        nt.links.new(in_spec_col.outputs[0], grp.inputs['SpecularColor'])
+        nt.links.new(grp.outputs['BSDF'], out.inputs['Surface'])
         try:
             nt.links.new(grp.outputs['ShadowMask'], aov_shadow.inputs['Value'])
             nt.links.new(grp.outputs['RimMask'], aov_rim.inputs['Value'])
@@ -747,11 +1103,16 @@ class ANIME_OT_setup_gp_lineart(bpy.types.Operator):
 class ANIME_AddonPreferences(bpy.types.AddonPreferences):
     bl_idname = "anime_pipeline"
 
+    # Use assignment style for broad 3.6 compatibility
     update_url = StringProperty(
-        name="Update Manifest URL",
-        description="HTTP/HTTPS URL to a JSON manifest describing the latest add-on release. Example schema: {\"version\":\"0.2.1\", \"zip_url\":\"https://.../anime_pipeline.zip\", \"notes\":\"...\"}",
+        name="(Deprecated) Manifest URL",
+        description="Deprecated. Updater now checks only GitHub Releases for the configured repo.",
         default="",
     )
+    github_owner = StringProperty(name="GitHub Owner", description="GitHub user or org (alternative to Update Manifest URL)", default="AtomaHuro")
+    github_repo = StringProperty(name="Repository", description="GitHub repository name", default="Anime-Tools")
+    github_asset_pattern = StringProperty(name="Asset Pattern", description="Substring to pick release asset zip (optional)", default="")
+    include_prereleases = BoolProperty(name="Include pre-releases", description="Allow installing GitHub pre-releases", default=False)
     auto_check = BoolProperty(name="Auto-check for updates", default=True)
     check_interval_hours = IntProperty(name="Check interval (hours)", default=12, min=1, max=168)
     last_check_iso = StringProperty(name="Last Check (ISO)", default="")
@@ -763,6 +1124,16 @@ class ANIME_AddonPreferences(bpy.types.AddonPreferences):
         layout = self.layout
         col = layout.column(align=True)
         col.prop(self, "update_url")
+        box = layout.box()
+        box.label(text="GitHub Source (updates use Releases API)")
+        rowg = box.row(align=True)
+        rowg.prop(self, "github_owner")
+        rowg.prop(self, "github_repo")
+        box.prop(self, "github_asset_pattern")
+        box.prop(self, "include_prereleases")
+        cur_owner = _safe_str(getattr(self, 'github_owner', 'AtomaHuro')) or 'AtomaHuro'
+        cur_repo = _safe_str(getattr(self, 'github_repo', 'Anime-Tools')) or 'Anime-Tools'
+        box.label(text=f"Current source: https://github.com/{cur_owner}/{cur_repo}")
         row = col.row(align=True)
         row.prop(self, "auto_check")
         row.prop(self, "check_interval_hours")
@@ -773,64 +1144,154 @@ class ANIME_AddonPreferences(bpy.types.AddonPreferences):
         if _UPDATE_STATE.get('available'):
             col.label(text=f"Update available: v{_UPDATE_STATE.get('remote_version')}")
             col.operator("anime.update_addon", text="Update Now", icon='FILE_REFRESH')
+        col.operator("anime.debug_updates", text="Debug GitHub Updates", icon='CONSOLE')
+
+def _gh_headers():
+    return {"User-Agent": "Anime-Pipeline-Addon/0.4 GitHubCopilot", "Accept": "application/vnd.github+json"}
+
+def _gh_get_json(url, timeout=10):
+    req = Request(url, headers=_gh_headers())
+    with urlopen(req, timeout=timeout) as resp:
+        body = resp.read().decode('utf-8')
+    return json.loads(body)
+
+def _select_release_and_asset(owner, repo, include_prereleases, pattern):
+    debug = {"endpoint": None, "fallback": False, "chosen_asset": None}
+    rel = None
+    # Try latest endpoint first
+    try:
+        url_latest = f"https://api.github.com/repos/{owner}/{repo}/releases/latest"
+        debug["endpoint"] = url_latest
+        data = _gh_get_json(url_latest)
+        if isinstance(data, dict) and data.get('tag_name'):
+            rel = data
+    except Exception:
+        rel = None
+    # Fallback to releases list
+    if rel is None:
+        try:
+            url_list = f"https://api.github.com/repos/{owner}/{repo}/releases"
+            debug["endpoint"] = url_list
+            debug["fallback"] = True
+            arr = _gh_get_json(url_list)
+            if isinstance(arr, list) and arr:
+                for r in arr:
+                    if r.get('draft'):
+                        continue
+                    if (not include_prereleases) and r.get('prerelease'):
+                        continue
+                    # Prefer a release with at least one asset
+                    if (r.get('assets') or []):
+                        rel = r
+                        break
+                # If still none, pick first non-draft regardless of assets
+                if rel is None:
+                    for r in arr:
+                        if not r.get('draft') and ((include_prereleases) or (not r.get('prerelease'))):
+                            rel = r
+                            break
+        except Exception:
+            rel = None
+
+    if not isinstance(rel, dict):
+        return None, None, None, debug
+
+    # Normalize version
+    tag = str(rel.get('tag_name') or rel.get('name') or '')
+    if tag.lower().startswith('v'):
+        tag = tag[1:]
+    notes = rel.get('body')
+    assets = rel.get('assets', []) or []
+
+    def is_zip_asset(a):
+        n = str(a.get('name') or '')
+        d = a.get('browser_download_url')
+        return bool(n and d and n.lower().endswith('.zip'))
+
+    chosen = None
+    if pattern:
+        for a in assets:
+            if is_zip_asset(a) and pattern.lower() in str(a.get('name','')).lower():
+                chosen = a; break
+    if not chosen:
+        prefs_names = ('anime', 'addon', 'pipeline')
+        for a in assets:
+            n = str(a.get('name') or '')
+            if is_zip_asset(a) and any(p in n.lower() for p in prefs_names):
+                chosen = a; break
+    if not chosen:
+        for a in assets:
+            if is_zip_asset(a):
+                chosen = a; break
+
+    debug["chosen_asset"] = (str(chosen.get('name')) if chosen else None)
+    zip_url = chosen.get('browser_download_url') if chosen else None
+    return tag or None, zip_url, notes, debug
 
 def _perform_update_check(prefs):
-    if not prefs or not getattr(prefs, 'update_url', ''):
+    if not prefs:
         return False
+    owner = _safe_str(getattr(prefs, 'github_owner', '')).strip() or 'AtomaHuro'
+    repo = _safe_str(getattr(prefs, 'github_repo', '')).strip() or 'Anime-Tools'
+    pattern = _safe_str(getattr(prefs, 'github_asset_pattern', '')).strip()
+    include_pr = _safe_bool(getattr(prefs, 'include_prereleases', False), False)
+
     try:
-        with urlopen(prefs.update_url, timeout=5) as resp:
-            data = resp.read()
-        manifest = None
-        try:
-            manifest = json.loads(data.decode('utf-8'))
-        except Exception:
-            manifest = None
-        if not isinstance(manifest, dict):
-            return False
-        remote_version = manifest.get('version') or manifest.get('tag') or manifest.get('version_string')
-        zip_url = manifest.get('zip_url') or manifest.get('download') or manifest.get('asset')
-        notes = manifest.get('notes') or manifest.get('body')
-        if not remote_version or not zip_url:
-            return False
-        prefs.last_remote_version = str(remote_version)
-        prefs.last_zip_url = str(zip_url)
-        prefs.last_notes = str(notes or '')
+        remote_version, zip_url, notes, _dbg = _select_release_and_asset(owner, repo, include_pr, pattern)
+    except Exception:
+        remote_version, zip_url, notes = None, None, None
+
+    if not remote_version or not zip_url:
         prefs.last_check_iso = __import__('datetime').datetime.utcnow().isoformat(timespec='seconds') + 'Z'
-        is_newer = _compare_versions(remote_version, bl_info.get('version')) > 0
-        _UPDATE_STATE['available'] = bool(is_newer)
-        _UPDATE_STATE['remote_version'] = str(remote_version)
-        _UPDATE_STATE['zip_url'] = str(zip_url)
-        _UPDATE_STATE['notes'] = str(notes or '')
-        return is_newer
-    except (URLError, HTTPError, TimeoutError, Exception):
+        prefs.last_remote_version = ''
+        prefs.last_zip_url = ''
+        prefs.last_notes = ''
+        _UPDATE_STATE['available'] = False
+        _UPDATE_STATE['remote_version'] = None
+        _UPDATE_STATE['zip_url'] = None
+        _UPDATE_STATE['notes'] = None
         return False
+
+    prefs.last_remote_version = str(remote_version)
+    prefs.last_zip_url = str(zip_url)
+    prefs.last_notes = str(notes or '')
+    prefs.last_check_iso = __import__('datetime').datetime.utcnow().isoformat(timespec='seconds') + 'Z'
+    is_newer = _compare_versions(remote_version, bl_info.get('version')) > 0
+    _UPDATE_STATE['available'] = bool(is_newer)
+    _UPDATE_STATE['remote_version'] = str(remote_version)
+    _UPDATE_STATE['zip_url'] = str(zip_url)
+    _UPDATE_STATE['notes'] = str(notes or '')
+    return is_newer
 
 def _auto_update_timer():
     try:
         addon_prefs = bpy.context.preferences.addons.get('anime_pipeline')
         prefs = addon_prefs.preferences if addon_prefs else None
-        if not prefs or not prefs.auto_check:
+        if not prefs or not _safe_bool(getattr(prefs, 'auto_check', True), True):
             return None
         # Throttle by interval
         import datetime
-        if prefs.last_check_iso:
+        last_iso = _safe_str(getattr(prefs, 'last_check_iso', ''))
+        if last_iso:
             try:
-                last = datetime.datetime.fromisoformat(prefs.last_check_iso.replace('Z',''))
+                last = datetime.datetime.fromisoformat(last_iso.replace('Z',''))
                 delta = datetime.datetime.utcnow() - last
-                if delta.total_seconds() < max(1, prefs.check_interval_hours) * 3600:
-                    return max(60.0, prefs.check_interval_hours * 3600.0)  # check later
+                hours = max(1, _safe_int(getattr(prefs, 'check_interval_hours', 12), 12))
+                if delta.total_seconds() < hours * 3600:
+                    return max(60.0, hours * 3600.0)  # check later
             except Exception:
                 pass
         _perform_update_check(prefs)
         # Schedule next run
-        return max(60.0, prefs.check_interval_hours * 3600.0)
+        hours = max(1, _safe_int(getattr(prefs, 'check_interval_hours', 12), 12))
+        return max(60.0, hours * 3600.0)
     except Exception:
         return None
 
 class ANIME_OT_check_updates(bpy.types.Operator):
     bl_idname = "anime.check_updates"
     bl_label = "Check for Updates"
-    bl_description = "Check the configured manifest URL for a newer add-on version"
+    bl_description = "Check GitHub Releases for a newer add-on version"
     bl_options = {"REGISTER"}
 
     def execute(self, context):
@@ -843,18 +1304,49 @@ class ANIME_OT_check_updates(bpy.types.Operator):
             self.report({'INFO'}, "No updates available or check failed")
         return {'FINISHED'}
 
+class ANIME_OT_debug_updates(bpy.types.Operator):
+    bl_idname = "anime.debug_updates"
+    bl_label = "Debug GitHub Updates"
+    bl_description = "Print the latest GitHub release JSON and the chosen asset to the console"
+    bl_options = {"REGISTER"}
+
+    def execute(self, context):
+        addon = context.preferences.addons.get('anime_pipeline')
+        prefs = addon.preferences if addon else None
+        if not prefs:
+            self.report({'ERROR'}, 'Preferences not available')
+            return {'CANCELLED'}
+        owner = _safe_str(getattr(prefs, 'github_owner', '')).strip() or 'AtomaHuro'
+        repo = _safe_str(getattr(prefs, 'github_repo', '')).strip() or 'Anime-Tools'
+        pattern = _safe_str(getattr(prefs, 'github_asset_pattern', '')).strip()
+        include_pr = _safe_bool(getattr(prefs, 'include_prereleases', False), False)
+        print(f"[Anime Pipeline][Debug Updates] owner={owner} repo={repo} pattern={pattern!r} include_prereleases={include_pr}")
+        try:
+            tag_norm, zip_url, notes, dbg = _select_release_and_asset(owner, repo, include_pr, pattern)
+            print(f"[Anime Pipeline][Debug Updates] endpoint={dbg.get('endpoint')} fallback={dbg.get('fallback')} chosen_asset={dbg.get('chosen_asset')} url={zip_url}")
+            print(f"[Anime Pipeline][Debug Updates] local_version={bl_info.get('version')}, remote_version={tag_norm}")
+            is_newer = _compare_versions(tag_norm, bl_info.get('version')) > 0 if tag_norm else False
+            msg = f"Source OK: remote v{tag_norm or 'None'} | asset: {dbg.get('chosen_asset') or 'None'} | newer={is_newer}"
+            self.report({'INFO'}, msg)
+        except Exception as e:
+            print("[Anime Pipeline][Debug Updates] Error:", e)
+            self.report({'ERROR'}, f"GitHub request failed: {e}")
+            return {'CANCELLED'}
+        return {'FINISHED'}
+
 class ANIME_OT_update_addon(bpy.types.Operator):
     bl_idname = "anime.update_addon"
     bl_label = "Update Add-on"
-    bl_description = "Download and install the latest add-on zip from the manifest"
+    bl_description = "Download and install the latest add-on zip from GitHub Releases"
     bl_options = {"REGISTER", "UNDO"}
 
     def execute(self, context):
         addon = context.preferences.addons.get('anime_pipeline')
         prefs = addon.preferences if addon else None
-        url = (_UPDATE_STATE.get('zip_url') or (prefs.last_zip_url if prefs else ''))
+        # Read URL safely from update state or preferences
+        url = _safe_str(_UPDATE_STATE.get('zip_url') or (_safe_str(getattr(prefs, 'last_zip_url', ''), '') if prefs else ''), '')
         if not url:
-            self.report({'WARNING'}, 'No download URL set. Configure Update Manifest URL in Add-on Preferences and check updates first.')
+            self.report({'WARNING'}, 'No download URL set. Configure GitHub Owner/Repository in Add-on Preferences and Check for Updates first.')
             return {'CANCELLED'}
         temp_dir = tempfile.gettempdir()
         zip_path = os.path.join(temp_dir, 'anime_pipeline_update.zip')
@@ -909,7 +1401,10 @@ class ANIME_OT_setup_freestyle(bpy.types.Operator):
         lineset.select_by_visibility = True
         # Style
         ls = lineset.linestyle
-        ls.thickness = self.thickness
+        try:
+            ls.thickness = float(self.thickness)
+        except Exception:
+            pass
         try:
             ls.color = (self.color[0], self.color[1], self.color[2])
         except Exception:
@@ -919,8 +1414,14 @@ class ANIME_OT_setup_freestyle(bpy.types.Operator):
             mod = ls.thickness_modifiers.new('DISTANCE_FROM_CAMERA')
             mod.range_min = 5.0
             mod.range_max = 30.0
-            mod.thickness_min = max(0.25, self.thickness * 0.3)
-            mod.thickness_max = self.thickness
+            try:
+                mod.thickness_min = float(max(0.25, float(self.thickness) * 0.3))
+            except Exception:
+                pass
+            try:
+                mod.thickness_max = float(self.thickness)
+            except Exception:
+                pass
             mod.invert = False
         except Exception:
             pass
@@ -1082,6 +1583,26 @@ class ANIME_PT_panel(bpy.types.Panel):
         col.separator()
         col.operator(ANIME_OT_convert_principled_to_toon.bl_idname, icon='SHADING_TEXTURE')
         col.operator(ANIME_OT_apply_toon_material.bl_idname, icon='MATERIAL')
+        # Style selection and apply
+        sbox = layout.box()
+        sbox.label(text="Style")
+        sbox.prop(context.scene, "anime_style_mode", text="Mode")
+        if context.scene.anime_style_mode == 'MANGA':
+            row = sbox.row(align=True)
+            row.prop(context.scene, "anime_manga_tone_scale", text="Tone Scale")
+            row = sbox.row(align=True)
+            row.prop(context.scene, "anime_manga_tone_angle", text="Angle")
+            row = sbox.row(align=True)
+            row.prop(context.scene, "anime_manga_tone_strength", text="Strength")
+            row = sbox.row(align=True)
+            row.prop(context.scene, "anime_manga_ink_color", text="Ink")
+            row = sbox.row(align=True)
+            row.prop(context.scene, "anime_manga_paper_color", text="Paper")
+            row = sbox.row(align=True)
+            row.prop(context.scene, "anime_manga_pattern_type", text="Pattern (0=Dots,1=Lines)")
+            row = sbox.row(align=True)
+            row.prop(context.scene, "anime_manga_invert_tone", text="Invert Tone")
+        sbox.operator(ANIME_OT_apply_style_material.bl_idname, icon='MATERIAL')
         col.operator(ANIME_OT_add_inverted_hull.bl_idname, icon='OUTLINER_OB_MESH')
         # Outline controls
         box = layout.box()
@@ -1108,7 +1629,6 @@ class ANIME_PT_panel(bpy.types.Panel):
         else:
             box.label(text="No update available")
         col.operator(ANIME_OT_batch_render_cameras.bl_idname, icon='RENDER_STILL')
-        col.operator(ANIME_OT_batch_render_cameras.bl_idname, icon='RENDER_STILL')
 
 # --- Registration ---
 
@@ -1116,6 +1636,7 @@ classes = (
     ANIME_AddonPreferences,
     ANIME_OT_add_inverted_hull,
     ANIME_OT_apply_toon_material,
+    ANIME_OT_apply_style_material,
     ANIME_OT_setup_scene,
     ANIME_OT_setup_compositor,
     ANIME_OT_create_toon_rig,
@@ -1124,6 +1645,7 @@ classes = (
     ANIME_OT_setup_gp_lineart,
     ANIME_OT_setup_freestyle,
     ANIME_OT_check_updates,
+    ANIME_OT_debug_updates,
     ANIME_OT_update_addon,
     ANIME_OT_apply_outline_settings,
     ANIME_OT_validate_environment,
@@ -1133,11 +1655,21 @@ classes = (
 def register():
     for c in classes:
         bpy.utils.register_class(c)
-    # Scene properties for outline controls
+    # Scene properties
     try:
+        # Outlines
         bpy.types.Scene.anime_outline_hull_thickness = FloatProperty(name="Hull Thickness (m)", default=0.005, min=0.0, max=0.1)
         bpy.types.Scene.anime_outline_line_thickness = FloatProperty(name="Line Thickness (px)", default=2.0, min=0.1, max=20.0)
         bpy.types.Scene.anime_outline_selected_only = BoolProperty(name="Affect Selected Meshes Only", default=True)
+        # Style
+        bpy.types.Scene.anime_style_mode = EnumProperty(name="Style", items=[('ANIME','Anime','Toon shader look'), ('MANGA','Manga','Halftone tone look')], default='ANIME')
+        bpy.types.Scene.anime_manga_tone_scale = FloatProperty(name="Tone Scale", default=80.0, min=2.0, max=400.0)
+        bpy.types.Scene.anime_manga_tone_angle = FloatProperty(name="Tone Angle", default=45.0, min=-180.0, max=180.0)
+        bpy.types.Scene.anime_manga_tone_strength = FloatProperty(name="Tone Strength", default=1.0, min=0.0, max=2.0)
+        bpy.types.Scene.anime_manga_ink_color = FloatVectorProperty(name="Ink Color", subtype='COLOR', default=(0.0,0.0,0.0), min=0.0, max=1.0)
+        bpy.types.Scene.anime_manga_paper_color = FloatVectorProperty(name="Paper Color", subtype='COLOR', default=(1.0,1.0,1.0), min=0.0, max=1.0)
+        bpy.types.Scene.anime_manga_pattern_type = FloatProperty(name="Pattern Type", description="0 = Dots, 1 = Lines", default=0.0, min=0.0, max=1.0)
+        bpy.types.Scene.anime_manga_invert_tone = FloatProperty(name="Invert Tone", description="0 = Normal, 1 = Inverted", default=0.0, min=0.0, max=1.0)
     except Exception:
         pass
     # Start update timer if enabled
@@ -1154,6 +1686,14 @@ def unregister():
         del bpy.types.Scene.anime_outline_hull_thickness
         del bpy.types.Scene.anime_outline_line_thickness
         del bpy.types.Scene.anime_outline_selected_only
+        del bpy.types.Scene.anime_style_mode
+        del bpy.types.Scene.anime_manga_tone_scale
+        del bpy.types.Scene.anime_manga_tone_angle
+        del bpy.types.Scene.anime_manga_tone_strength
+        del bpy.types.Scene.anime_manga_ink_color
+        del bpy.types.Scene.anime_manga_paper_color
+        del bpy.types.Scene.anime_manga_pattern_type
+        del bpy.types.Scene.anime_manga_invert_tone
     except Exception:
         pass
 
