@@ -35,15 +35,30 @@ Modern NPR toolkit for anime/manga workflows in Blender 4.5.x LTS: cel shaders, 
 	- Unstep Keys (restore Bezier)
 - Updates
 	- Quick link to project GitHub from the panel
+------------
 
+   <img width="1918" height="1033" alt="Screenshot 2025-09-03 184953" src="https://github.com/user-attachments/assets/9f03076d-6680-4859-90c3-8a273f3b3470" />
+   
+------------
 ## Installation
-1. Create the ZIP (from this workspace): run the VS Code task “Zip Blender add-on (script)”. It outputs:
-	 - `c:\Users\unspo\Desktop\Projects\Animation Studio\anime-manga-shader-addon.zip`
-2. In Blender: Edit > Preferences > Add-ons > Install…
+1a. In Blender: Edit > Preferences 
+
+   <img width="1919" height="1027" alt="Screenshot 2025-09-03 191333" src="https://github.com/user-attachments/assets/d010fd61-7693-48ae-9da2-e0cc3fb7f22d" />
+
+   ------------
+   1b. Add-ons > Install…
+   
+   <img width="1919" height="1033" alt="Screenshot 2025-09-03 190831" src="https://github.com/user-attachments/assets/bcf4662e-bf6d-4f18-b503-10ecbed10995" />
+   
 3. Pick the ZIP and enable the add-on.
+   
+   ------------
 
 ## Where to find it in Blender
-- Shader Editor > Sidebar (N) > “Anime & Manga” tab
+**Shader Editor**
+<img width="1919" height="1032" alt="Screenshot 2025-09-03 192809" src="https://github.com/user-attachments/assets/cad0badd-398a-42db-b190-3677fa67bec0" />
+**Sidebar (N) > “Anime & Manga” tab"**
+<img width="1919" height="1032" alt="Screenshot 2025-09-03 193035" src="https://github.com/user-attachments/assets/10c78d1e-dec0-4b19-8da5-0650fef83643" />
 
 ## Quick usage
 1. Create a shader
@@ -62,21 +77,9 @@ Modern NPR toolkit for anime/manga workflows in Blender 4.5.x LTS: cel shaders, 
 	 - “Step Keys (2s/3s/4s)” to hold poses; “Unstep Keys (Bezier)” to restore smoothing.
 
 ## Notes & data
-- User presets live in `data/presets.json`. Built-in defaults are protected from deletion.
+- User presets are removeable. Built-in defaults are protected from deletion.
 - Texture overlay properties exist per material; controls appear when a material is active.
 - The panel is available when the Shader Editor is active.
-
-## Packaging from VS Code
-- Run the task: “Zip Blender add-on (script)”. The ZIP is regenerated in the workspace root.
-
-## Optional: create the README GIF
-- Requirements: ffmpeg installed and on PATH
-- Use the helper script to convert a short MP4/MOV into `assets/preview.gif`:
-
-```powershell
-# Example: 6-second 720p, 15 fps segment from 00:00:02
-powershell -ExecutionPolicy Bypass -File scripts/make_gif.ps1 -Input "C:\path\to\clip.mp4" -Start 2 -Duration 6 -Width 720 -Fps 15
-```
 
 ## Support & Contributions
 - Issues and feature requests: https://github.com/AtomaHuro/Anime-Tools/issues
